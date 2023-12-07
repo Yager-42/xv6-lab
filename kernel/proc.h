@@ -1,3 +1,16 @@
+#define NVMA 16
+// Virtual Memory Area
+struct vma {
+ int valid;
+ uint64 addr;
+ int length;
+ int prot;
+ int flags;
+ int fd;
+ int offset;
+ struct file* f;
+};
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -103,4 +116,6 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct vma vmas[NVMA];       // Virtual memory area array
 };
+

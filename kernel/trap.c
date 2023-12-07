@@ -1,10 +1,14 @@
 #include "types.h"
+#include "fcntl.h"
 #include "param.h"
 #include "memlayout.h"
 #include "riscv.h"
 #include "spinlock.h"
+#include "sleeplock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fs.h"
+#include "file.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -67,6 +71,51 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  }else if(r_scause() == 13 || r_scause() == 15){
+    uint64 va = r_stval();
+    struct proc* p =myproc();
+    if(MAXVA<va || va>p->sz)
+    {
+      p->killed = 1;
+    }
+    else{
+      int found = 0;
+      for(int i=0;i<NVMA;++i)
+      {
+        struct vma* vma = &p->vmas[i];
+        if (vma->valid && va >= vma->addr && va < vma->addr+vma->length) {
+          //所有的vma一开始都没申请页面,找到对应的vma, 分配一个新的4096字节的物理页
+          va = PGROUNDDOWN(va);
+          uint64 pa = (uint64)kalloc();
+          if(pa==0){
+            break;
+          }
+          memset((void*)pa,0,PGSIZE);
+          ilock(vma->f->ip);
+          //从inode读数据到pa
+          if(readi(vma->f->ip, 0, pa, vma->offset + va - vma->addr, PGSIZE) < 0) {
+            iunlock(vma->f->ip);
+            break;
+          }
+          iunlock(vma->f->ip);
+          int perm = PTE_U; // 权限设置
+          if (vma->prot & PROT_READ)
+            perm |= PTE_R;
+          if (vma->prot & PROT_WRITE)
+            perm |= PTE_W;
+          if (vma->prot & PROT_EXEC)
+            perm |= PTE_X;
+          if (mappages(p->pagetable, va, PGSIZE, pa, perm) < 0) {
+            kfree((void*)pa);
+            break;
+          }
+          found = 1;
+          break;
+        }
+      }
+      if(!found)
+        p->killed = 1;
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
