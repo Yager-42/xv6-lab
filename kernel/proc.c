@@ -121,6 +121,26 @@ found:
     return 0;
   }
 
+  // Allocate the per-process kernel page table
+  // 为这个进程分配并初始化一个新的专属内核页
+  p->kpagetable = ukvminit();
+  if(p->kpagetable == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // remap the kernel stack page per process
+  // physical address is already allocated in procinit()
+  // 每个kernel stack的虚拟地址va是已经提前决定好的 直接算出它对应的pa(在procinit完成了pa的生成)
+  // 然后把这个映射加入到新的专属内核页里
+  //按照实验要求，每一个进程的内核页表都关于该进程的内核栈有一个映射
+  uint64 va = KSTACK((int) (p - proc));
+  pte_t pa = kvmpa(va);
+  memset((void *)pa, 0, PGSIZE); // 刷新清空kernel stack
+  ukvmmap(p->kpagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -150,6 +170,13 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  if (p->kpagetable) {
+    freeprockvm(p->kpagetable,p->kstack);
+    p->kpagetable = 0;
+  }
+  if (p->kstack) {
+    p->kstack = 0;
+  }
 }
 
 // Create a user page table for a given process,
@@ -221,6 +248,8 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  pagecopy(p->pagetable,p->kpagetable,0,p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -243,12 +272,24 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    //超长或者分配失败
+    if(sz+n>PLIC || (sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+      return -1;
+    }
+    if (pagecopy(p->pagetable, p->kpagetable, p->sz, sz) != 0) {
+      // 增量同步[old size, new size]
       return -1;
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    if(sz !=p ->sz)
+    {
+      //长度有变化，删除多出来的映射
+      uvmunmap(p->kpagetable, PGROUNDUP(sz), (PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE, 0);
+    }
   }
+  //刷新tlb
+  ukvminithart(p->kpagetable);
   p->sz = sz;
   return 0;
 }
@@ -274,7 +315,13 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
-
+  //将进程页表复制到进程的内核页表
+  if (pagecopy(np->pagetable, np->kpagetable, 0, np->sz) != 0) 
+  {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
   np->parent = p;
 
   // copy saved user registers.
@@ -473,10 +520,16 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        // 切换到要马上运行的新进程的内核页表
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
+        // 切换回全局内核页表
+        //按照实验，没有进程运行时scheduler()应当使用kernel_pagetable
+        kvminithart();
         c->proc = 0;
 
         found = 1;
