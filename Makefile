@@ -7,6 +7,7 @@
 
 K=kernel
 U=user
+N=notxv6
 
 OBJS = \
   $K/entry.o \
@@ -175,7 +176,7 @@ UPROGS=\
 	$U/_grind\
 	$U/_wc\
 	$U/_zombie\
-
+	$U/_uthread\
 
 
 
