@@ -46,9 +46,18 @@ sys_sbrk(void)
 
   if(argint(0, &n) < 0)
     return -1;
-  addr = myproc()->sz;
-  if(growproc(n) < 0)
-    return -1;
+  struct proc* p = myproc();
+  addr = p->sz;
+  if(n>=0)
+  {
+    p->sz += n; // 虚假地增加size而不物理分配
+  }
+  else
+  {
+    uint64 oldz = p->sz;
+    uint64 newz = p->sz + n;
+    p->sz = uvmdealloc(p->pagetable, oldz, newz);
+  }
   return addr;
 }
 

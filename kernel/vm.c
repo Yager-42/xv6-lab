@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -181,9 +183,14 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
+      //访问到有效位为0的页表项不代表出错，比如子进程复制父进程内存空间，遇到有效位为0页表项说明当前页表项指向的页表不可用
+      //即要么懒分配增长内存还没被处理，说明子进程也不用理会这部分
+      //panic("uvmunmap: walk");
+      continue;
     if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+      //懒分配中遇到有效位为0的页表项不一定有错误，因为一开始只分配了大小，没有分配实际内存，pannic了就不能进一步处理了
+      //panic("uvmunmap: not mapped");     
+      continue;
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -193,6 +200,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     *pte = 0;
   }
 }
+
 
 // create an empty user page table.
 // returns 0 if out of memory.
@@ -315,9 +323,11 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
+      //panic("uvmcopy: pte should exist");
+      continue;//处理原因和uvmunmap同理
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      //panic("uvmcopy: page not present");
+      continue;
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -355,12 +365,36 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
+  struct proc* p = myproc();
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
     pa0 = walkaddr(pagetable, va0);
+    //解释看copyin
     if(pa0 == 0)
-      return -1;
+    {
+      if(va0>=p->sz || va0<p->trapframe->sp)
+      {
+        return -1;
+      }
+      else
+      {
+        pa0 = (uint64)kalloc();
+        if(pa0 == 0)
+        {
+          p->killed = 1;
+        }
+        else
+        {
+          memset((void*)pa0,0,PGSIZE);
+          if(mappages(p->pagetable, va0, PGSIZE, pa0, PTE_W|PTE_R|PTE_U) != 0) 
+          {
+            kfree((void *)pa0);
+            p->killed = 1;
+          }
+        }
+      }
+    }
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -381,11 +415,36 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
   uint64 n, va0, pa0;
 
+  //获得当前进程
+  struct proc* p = myproc();
+
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
+    if(pa0 == 0)//在uvmcopy等函数中，遇到无效的pa我们直接略过，在这里才处理
+    {
+      if(va0>=p->sz || va0<p->trapframe->sp)
+      {
+        //va是无效值,说明输入有问题，但不杀死进程
+        return -1;
+      }
+      else
+      {
+        pa0 = (uint64) kalloc();
+        if(pa0 == 0)
+        {
+          //实验书要求遇到不能分配时，将进程杀死
+          p->killed = 1;
+        }
+        memset((void*)pa0,0,PGSIZE);
+        if(mappages(p->pagetable, va0, PGSIZE, pa0, PTE_W|PTE_R|PTE_U) != 0) 
+        {
+          kfree((void *)pa0);
+          //实验书要求遇到不能分配时，将进程杀死
+          p->killed = 1;
+        }
+      }
+    }
     n = PGSIZE - (srcva - va0);
     if(n > len)
       n = len;
